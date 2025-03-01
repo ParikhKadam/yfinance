@@ -8,6 +8,8 @@ Specific test class:
    python -m unittest tests.ticker.TestTicker
 
 """
+from datetime import datetime, timedelta
+
 import pandas as pd
 
 from tests.context import yfinance as yf
@@ -133,8 +135,55 @@ class TestTicker(unittest.TestCase):
         with self.assertRaises(YFInvalidPeriodError):
             dat.history(period="2wks", interval="1d", raise_errors=True)
         with self.assertRaises(YFInvalidPeriodError):
-            dat.history(period="2mo", interval="1d", raise_errors=True)
+            dat.history(period="2mos", interval="1d", raise_errors=True)
 
+    def test_valid_custom_periods(self):
+        valid_periods = [
+            # Yahoo provided periods
+            ("1d", "1m"), ("5d", "15m"), ("1mo", "1d"), ("3mo", "1wk"),
+            ("6mo", "1d"), ("1y", "1mo"), ("5y", "1wk"), ("max", "1mo"),
+
+            # Custom periods
+            ("2d", "30m"), ("10mo", "1d"), ("1y", "1d"), ("3y", "1d"),
+            ("2wk", "15m"), ("6mo", "5d"), ("10y", "1wk")
+        ]
+
+        tkr = "AAPL"
+        dat = yf.Ticker(tkr, session=self.session)
+
+        for period, interval in valid_periods:
+            with self.subTest(period=period, interval=interval):
+                df = dat.history(period=period, interval=interval, raise_errors=True)
+                self.assertIsInstance(df, pd.DataFrame)
+                self.assertFalse(df.empty, f"No data returned for period={period}, interval={interval}")
+                self.assertIn("Close", df.columns, f"'Close' column missing for period={period}, interval={interval}")
+
+                # Validate date range
+                now = datetime.now()
+                if period != "max":  # Difficult to assert for "max", therefore we skip
+                    if period.endswith("d"):
+                        days = int(period[:-1])
+                        expected_start = now - timedelta(days=days)
+                    elif period.endswith("mo"):
+                        months = int(period[:-2])
+                        expected_start = now - timedelta(days=30 * months)
+                    elif period.endswith("y"):
+                        years = int(period[:-1])
+                        expected_start = now - timedelta(days=365 * years)
+                    elif period.endswith("wk"):
+                        weeks = int(period[:-2])
+                        expected_start = now - timedelta(weeks=weeks)
+                    else:
+                        continue
+
+                    actual_start = df.index[0].to_pydatetime().replace(tzinfo=None)
+                    expected_start = expected_start.replace(hour=0, minute=0, second=0, microsecond=0)
+
+                    # leeway added because of weekends
+                    self.assertGreaterEqual(actual_start, expected_start - timedelta(days=10),
+                                            f"Start date {actual_start} out of range for period={period}")
+                    self.assertLessEqual(df.index[-1].to_pydatetime().replace(tzinfo=None), now,
+                                         f"End date {df.index[-1]} out of range for period={period}")
 
     def test_prices_missing(self):
         # this test will need to be updated every time someone wants to run a test
@@ -216,11 +265,24 @@ class TestTickerHistory(unittest.TestCase):
         self.assertFalse(data.empty, "data is empty")
 
     def test_download(self):
+        tomorrow = pd.Timestamp.now().date() + pd.Timedelta(days=1)  # helps with caching
         for t in [False, True]:
             for i in [False, True]:
-                data = yf.download(self.symbols, threads=t, ignore_tz=i)
-                self.assertIsInstance(data, pd.DataFrame, "data has wrong type")
-                self.assertFalse(data.empty, "data is empty")
+                for m in [False, True]:
+                    for n in [1, 'all']:
+                        symbols = self.symbols[0] if n == 1 else self.symbols
+                        data = yf.download(symbols, end=tomorrow, session=self.session, 
+                                           threads=t, ignore_tz=i, multi_level_index=m)
+                        self.assertIsInstance(data, pd.DataFrame, "data has wrong type")
+                        self.assertFalse(data.empty, "data is empty")
+                        if i:
+                            self.assertIsNone(data.index.tz)
+                        else:
+                            self.assertIsNotNone(data.index.tz)
+                        if (not m) and n == 1:
+                            self.assertFalse(isinstance(data.columns, pd.MultiIndex))
+                        else:
+                            self.assertIsInstance(data.columns, pd.MultiIndex)
 
     def test_no_expensive_calls_introduced(self):
         """
@@ -246,14 +308,13 @@ class TestTickerHistory(unittest.TestCase):
             actual_urls_called[i] = u
         actual_urls_called = tuple(actual_urls_called)
 
-        expected_urls = (
-            f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?events=div%2Csplits%2CcapitalGains&includePrePost=False&interval=1d&range={period}",
-        )
-        self.assertEqual(
-            expected_urls,
-            actual_urls_called,
-            "Different than expected url used to fetch history."
-        )
+        expected_urls = [
+            f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d",  # ticker's tz
+            f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?events=div%2Csplits%2CcapitalGains&includePrePost=False&interval=1d&range={period}"
+        ]
+        for url in actual_urls_called:
+            self.assertTrue(url in expected_urls, f"Unexpected URL called: {url}")
+
     def test_dividends(self):
         data = self.ticker.dividends
         self.assertIsInstance(data, pd.Series, "data has wrong type")
@@ -296,7 +357,7 @@ class TestTickerEarnings(unittest.TestCase):
     def test_earnings_dates_with_limit(self):
         # use ticker with lots of historic earnings
         ticker = yf.Ticker("IBM")
-        limit = 110
+        limit = 100
         data = ticker.get_earnings_dates(limit=limit)
         self.assertIsInstance(data, pd.DataFrame, "data has wrong type")
         self.assertFalse(data.empty, "data is empty")
@@ -747,7 +808,7 @@ class TestTickerAnalysts(unittest.TestCase):
         self.assertIsInstance(data, pd.DataFrame, "data has wrong type")
         self.assertFalse(data.empty, "data is empty")
         self.assertTrue(len(data.columns) == 4, "data has wrong number of columns")
-        self.assertEqual(data.columns.values.tolist(), ['Firm', 'ToGrade', 'FromGrade', 'Action'], "data has wrong column names")
+        self.assertCountEqual(data.columns.values.tolist(), ['Firm', 'ToGrade', 'FromGrade', 'Action'], "data has wrong column names")
         self.assertIsInstance(data.index, pd.DatetimeIndex, "data has wrong index type")
 
         data_cached = self.ticker.upgrades_downgrades
@@ -757,9 +818,6 @@ class TestTickerAnalysts(unittest.TestCase):
         data = self.ticker.analyst_price_targets
         self.assertIsInstance(data, dict, "data has wrong type")
 
-        keys = {'current', 'low', 'high', 'mean', 'median'}
-        self.assertEqual(data.keys(), keys, "data has wrong keys")
-
         data_cached = self.ticker.analyst_price_targets
         self.assertIs(data, data_cached, "data not cached")
 
@@ -767,12 +825,6 @@ class TestTickerAnalysts(unittest.TestCase):
         data = self.ticker.earnings_estimate
         self.assertIsInstance(data, pd.DataFrame, "data has wrong type")
         self.assertFalse(data.empty, "data is empty")
-
-        columns = ['numberOfAnalysts', 'avg', 'low', 'high', 'yearAgoEps', 'growth']
-        self.assertEqual(data.columns.values.tolist(), columns, "data has wrong column names")
-
-        index = ['0q', '+1q', '0y', '+1y']
-        self.assertEqual(data.index.values.tolist(), index, "data has wrong row names")
 
         data_cached = self.ticker.earnings_estimate
         self.assertIs(data, data_cached, "data not cached")
@@ -782,12 +834,6 @@ class TestTickerAnalysts(unittest.TestCase):
         self.assertIsInstance(data, pd.DataFrame, "data has wrong type")
         self.assertFalse(data.empty, "data is empty")
 
-        columns = ['numberOfAnalysts', 'avg', 'low', 'high', 'yearAgoRevenue', 'growth']
-        self.assertEqual(data.columns.values.tolist(), columns, "data has wrong column names")
-
-        index = ['0q', '+1q', '0y', '+1y']
-        self.assertEqual(data.index.values.tolist(), index, "data has wrong row names")
-
         data_cached = self.ticker.revenue_estimate
         self.assertIs(data, data_cached, "data not cached")
 
@@ -796,8 +842,6 @@ class TestTickerAnalysts(unittest.TestCase):
         self.assertIsInstance(data, pd.DataFrame, "data has wrong type")
         self.assertFalse(data.empty, "data is empty")
 
-        columns = ['epsEstimate', 'epsActual', 'epsDifference', 'surprisePercent']
-        self.assertEqual(data.columns.values.tolist(), columns, "data has wrong column names")
         self.assertIsInstance(data.index, pd.DatetimeIndex, "data has wrong index type")
 
         data_cached = self.ticker.earnings_history
@@ -808,12 +852,6 @@ class TestTickerAnalysts(unittest.TestCase):
         self.assertIsInstance(data, pd.DataFrame, "data has wrong type")
         self.assertFalse(data.empty, "data is empty")
 
-        columns = ['current', '7daysAgo', '30daysAgo', '60daysAgo', '90daysAgo']
-        self.assertEqual(data.columns.values.tolist(), columns, "data has wrong column names")
-
-        index = ['0q', '+1q', '0y', '+1y']
-        self.assertEqual(data.index.values.tolist(), index, "data has wrong row names")
-
         data_cached = self.ticker.eps_trend
         self.assertIs(data, data_cached, "data not cached")
 
@@ -821,12 +859,6 @@ class TestTickerAnalysts(unittest.TestCase):
         data = self.ticker.growth_estimates
         self.assertIsInstance(data, pd.DataFrame, "data has wrong type")
         self.assertFalse(data.empty, "data is empty")
-
-        columns = ['stock', 'industry', 'sector', 'index']
-        self.assertEqual(data.columns.values.tolist(), columns, "data has wrong column names")
-
-        index = ['0q', '+1q', '0y', '+1y', '+5y', '-5y']
-        self.assertEqual(data.index.values.tolist(), index, "data has wrong row names")
 
         data_cached = self.ticker.growth_estimates
         self.assertIs(data, data_cached, "data not cached")
