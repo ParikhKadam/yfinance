@@ -23,6 +23,7 @@ from __future__ import print_function
 
 import datetime as _datetime
 import logging
+import re
 import re as _re
 import sys as _sys
 import threading
@@ -39,7 +40,6 @@ from dateutil.relativedelta import relativedelta
 from pytz import UnknownTimeZoneError
 
 from yfinance import const
-from .const import _BASE_URL_
 
 user_agent_headers = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/39.0.2171.95 Safari/537.36'}
@@ -189,24 +189,27 @@ def is_isin(string):
 def get_all_by_isin(isin, proxy=None, session=None):
     if not (is_isin(isin)):
         raise ValueError("Invalid ISIN number")
+
+    # Deferred this to prevent circular imports
+    from .search import Search
+
     session = session or _requests
-    url = f"{_BASE_URL_}/v1/finance/search?q={isin}"
-    data = session.get(url=url, proxies=proxy, headers=user_agent_headers)
-    try:
-        data = data.json()
-        ticker = data.get('quotes', [{}])[0]
-        return {
-            'ticker': {
-                'symbol': ticker['symbol'],
-                'shortname': ticker['shortname'],
-                'longname': ticker['longname'],
-                'type': ticker['quoteType'],
-                'exchange': ticker['exchDisp'],
-            },
-            'news': data.get('news', [])
-        }
-    except Exception:
-        return {}
+    search = Search(query=isin, max_results=1, session=session, proxy=proxy)
+
+    # Extract the first quote and news
+    ticker = search.quotes[0] if search.quotes else {}
+    news = search.news
+
+    return {
+        'ticker': {
+            'symbol': ticker.get('symbol', ''),
+            'shortname': ticker.get('shortname', ''),
+            'longname': ticker.get('longname', ''),
+            'type': ticker.get('quoteType', ''),
+            'exchange': ticker.get('exchDisp', ''),
+        },
+        'news': news
+    }
 
 
 def get_ticker_by_isin(isin, proxy=None, session=None):
@@ -427,24 +430,26 @@ def _parse_user_dt(dt, exchange_tz):
 
 
 def _interval_to_timedelta(interval):
-    if interval == "1mo":
-        return relativedelta(months=1)
-    elif interval == "3mo":
-        return relativedelta(months=3)
-    elif interval == "6mo":
-        return relativedelta(months=6)
-    elif interval == "1y":
-        return relativedelta(years=1)
-    elif interval == "2y":
-        return relativedelta(years=2)
-    elif interval == "5y":
-        return relativedelta(years=5)
-    elif interval == "10y":
-        return relativedelta(years=10)
-    elif interval == "1wk":
-        return _pd.Timedelta(days=7)
+    if interval[-1] == "d":
+        return relativedelta(days=int(interval[:-1]))
+    elif interval[-2:] == "wk":
+        return relativedelta(weeks=int(interval[:-2]))
+    elif interval[-2:] == "mo":
+        return relativedelta(months=int(interval[:-2]))
+    elif interval[-1] == "y":
+        return relativedelta(years=int(interval[:-1]))
     else:
         return _pd.Timedelta(interval)
+
+
+def is_valid_period_format(period):
+    """Check if the provided period has a valid format."""
+    if period is None:
+        return False
+
+    # Regex pattern to match valid period formats like '1d', '2wk', '3mo', '1y'
+    valid_pattern = r"^[1-9]\d*(d|wk|mo|y)$"
+    return bool(re.match(valid_pattern, period))
 
 
 def auto_adjust(data):
@@ -613,7 +618,7 @@ def fix_Yahoo_returning_live_separate(quotes, interval, tz_exchange, repair=Fals
             # - exception is volume, *slightly* greater on final row (and matches website)
             if dt1.date() == dt2.date():
                 # Last two rows are on same day. Drop second-to-last row
-                quotes = quotes.drop(quotes.index[n - 2])
+                quotes = _pd.concat([quotes.iloc[:-2], quotes.iloc[-1:]])
         else:
             if interval == "1wk":
                 last_rows_same_interval = dt1.year == dt2.year and dt1.week == dt2.week
@@ -932,3 +937,166 @@ class ProgressBar:
     def __str__(self):
         return str(self.prog_bar)
 
+def dynamic_docstring(placeholders: dict):
+    """
+    A decorator to dynamically update the docstring of a function or method.
+    
+    Args:
+        placeholders (dict): A dictionary where keys are placeholder names and values are the strings to insert.
+    """
+    def decorator(func):
+        if func.__doc__:
+            docstring = func.__doc__
+            # Replace each placeholder with its corresponding value
+            for key, value in placeholders.items():
+                docstring = docstring.replace(f"{{{key}}}", value)
+            func.__doc__ = docstring
+        return func
+    return decorator
+
+def _generate_table_configurations(title = None) -> str:
+    import textwrap
+    if title is None:
+        title = "Permitted Keys/Values"
+    table = textwrap.dedent(f"""
+    .. list-table:: {title}
+       :widths: 25 75
+       :header-rows: 1
+
+       * - Key
+         - Values
+    """)
+
+    return table
+
+def generate_list_table_from_dict(data: dict, bullets: bool=True, title: str=None) -> str:
+    """
+    Generate a list-table for the docstring showing permitted keys/values.
+    """
+    table = _generate_table_configurations(title)
+    for k in sorted(data.keys()):
+        values = data[k]
+        table += ' '*3 + f"* - {k}\n"
+        lengths = [len(str(v)) for v in values]
+        if bullets and max(lengths) > 5:
+            table += ' '*5 + "-\n"
+            for value in sorted(values):
+                table += ' '*7 + f"- {value}\n"
+        else:
+            value_str = ', '.join(sorted(values))
+            table += ' '*5 + f"- {value_str}\n"
+    return table
+
+# def generate_list_table_from_dict_of_dict(data: dict, bullets: bool=True, title: str=None) -> str:
+#     """
+#     Generate a list-table for the docstring showing permitted keys/values.
+#     """
+#     table = _generate_table_configurations(title)
+#     for k in sorted(data.keys()):
+#         values = data[k]
+#         table += ' '*3 + f"* - {k}\n"
+#         if bullets:
+#             table += ' '*5 + "-\n"
+#             for value in sorted(values):
+#                 table += ' '*7 + f"- {value}\n"
+#         else:
+#             table += ' '*5 + f"- {values}\n"
+#     return table
+
+
+def generate_list_table_from_dict_universal(data: dict, bullets: bool=True, title: str=None, concat_keys=[]) -> str:
+    """
+    Generate a list-table for the docstring showing permitted keys/values.
+    """
+    table = _generate_table_configurations(title)
+    for k in data.keys():
+        values = data[k]
+
+        table += ' '*3 + f"* - {k}\n"
+        if isinstance(values, dict):
+            table_add = ''
+
+            concat_short_lines = k in concat_keys
+
+            if bullets:
+                k_keys = sorted(list(values.keys()))
+                current_line = ''
+                block_format = 'query' in k_keys
+                for i in range(len(k_keys)):
+                    k2 = k_keys[i]
+                    k2_values = values[k2]
+                    k2_values_str = None
+                    if isinstance(k2_values, set):
+                        k2_values = list(k2_values)
+                    elif isinstance(k2_values, dict) and len(k2_values) == 0:
+                        k2_values = []
+                    if isinstance(k2_values, list):
+                        k2_values = sorted(k2_values)
+                        all_scalar = all(isinstance(k2v, (int, float, str)) for k2v in k2_values)
+                        if all_scalar:
+                            k2_values_str = _re.sub(r"[{}\[\]']", "", str(k2_values))
+
+                    if k2_values_str is None:
+                        k2_values_str = str(k2_values)
+
+                    if len(current_line) > 0 and (len(current_line) + len(k2_values_str) > 40):
+                        # new line
+                        table_add += current_line + '\n'
+                        current_line = ''
+
+                    if concat_short_lines:
+                        if current_line == '':
+                            current_line += ' '*5
+                            if i == 0:
+                                # Only add dash to first
+                                current_line += "- "
+                            else:
+                                current_line += "  "
+                            # Don't draw bullet points:
+                            current_line += '| '
+                        else:
+                            current_line += '.  '
+                        current_line += f"{k2}: " + k2_values_str
+                    else:
+                        table_add += ' '*5
+                        if i == 0:
+                            # Only add dash to first
+                            table_add += "- "
+                        else:
+                            table_add += "  "
+
+                        if '\n' in k2_values_str:
+                            # Block format multiple lines
+                            table_add += '| ' + f"{k2}: " + "\n"
+                            k2_values_str_lines = k2_values_str.split('\n')
+                            for j in range(len(k2_values_str_lines)):
+                                line = k2_values_str_lines[j]
+                                table_add += ' '*7 + '|' + ' '*5 + line
+                                if j < len(k2_values_str_lines)-1:
+                                    table_add += "\n"
+                        else:
+                            if block_format:
+                                table_add += '| '
+                            else:
+                                table_add += '* '
+                            table_add += f"{k2}: " + k2_values_str
+
+                        table_add += "\n"
+                if current_line != '':
+                    table_add += current_line + '\n'
+            else:
+                table_add += ' '*5 + f"- {values}\n"
+
+            table += table_add
+
+        else:
+            lengths = [len(str(v)) for v in values]
+            if bullets and max(lengths) > 5:
+                table += ' '*5 + "-\n"
+                for value in sorted(values):
+                    table += ' '*7 + f"- {value}\n"
+            else:
+                value_str = ', '.join(sorted(values))
+                table += ' '*5 + f"- {value_str}\n"
+
+    return table

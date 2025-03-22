@@ -21,18 +21,18 @@
 
 from __future__ import print_function
 
-from io import StringIO
 import json as _json
 import warnings
 from typing import Optional, Union
 from urllib.parse import quote as urlencode
 
+import numpy as np
 import pandas as pd
 import requests
 
 from . import utils, cache
 from .data import YfData
-from .exceptions import YFEarningsDateMissing
+from .exceptions import YFEarningsDateMissing, YFRateLimitError
 from .scrapers.analysis import Analysis
 from .scrapers.fundamentals import Fundamentals
 from .scrapers.holders import Holders
@@ -40,8 +40,10 @@ from .scrapers.quote import Quote, FastInfo
 from .scrapers.history import PriceHistory
 from .scrapers.funds import FundsData
 
-from .const import _BASE_URL_, _ROOT_URL_
+from .const import _BASE_URL_, _ROOT_URL_, _QUERY1_URL_
 
+
+_tz_info_fetch_ctr = 0
 
 class TickerBase:
     def __init__(self, ticker, session=None, proxy=None):
@@ -100,9 +102,19 @@ class TickerBase:
 
         if tz is None:
             tz = self._fetch_ticker_tz(proxy, timeout)
-
+            if tz is None:
+                # _fetch_ticker_tz works in 99.999% of cases.
+                # For rare fail get from info.
+                global _tz_info_fetch_ctr
+                if _tz_info_fetch_ctr < 2:
+                    # ... but limit. If _fetch_ticker_tz() always
+                    # failing then bigger problem.
+                    _tz_info_fetch_ctr += 1
+                    for k in ['exchangeTimezoneName', 'timeZoneFullName']:
+                        if k in self.info:
+                            tz = self.info[k]
+                            break
             if utils.is_valid_timezone(tz):
-                # info fetch is relatively slow so cache timezone
                 c.store(self.ticker, tz)
             else:
                 tz = None
@@ -124,6 +136,9 @@ class TickerBase:
         try:
             data = self._data.cache_get(url=url, params=params, proxy=proxy, timeout=timeout)
             data = data.json()
+        except YFRateLimitError:
+            # Must propagate this
+            raise
         except Exception as e:
             logger.error(f"Failed to get ticker '{self.ticker}' reason: {e}")
             return None
@@ -315,7 +330,7 @@ class TickerBase:
                 Return table as Python dict
                 Default is False
             freq: str
-                "yearly" or "quarterly"
+                "yearly" or "quarterly" or "trailing"
                 Default is "yearly"
             proxy: str
                 Optional. Proxy server URL scheme
@@ -342,7 +357,7 @@ class TickerBase:
                 Format row names nicely for readability
                 Default is False
             freq: str
-                "yearly" or "quarterly"
+                "yearly" or "quarterly" or "trailing"
                 Default is "yearly"
             proxy: str
                 Optional. Proxy server URL scheme
@@ -425,17 +440,17 @@ class TickerBase:
     def get_cashflow(self, proxy=None, as_dict=False, pretty=False, freq="yearly"):
         return self.get_cash_flow(proxy, as_dict, pretty, freq)
 
-    def get_dividends(self, proxy=None) -> pd.Series:
-        return self._lazy_load_price_history().get_dividends(proxy)
+    def get_dividends(self, proxy=None, period="max") -> pd.Series:
+        return self._lazy_load_price_history().get_dividends(period=period, proxy=proxy)
 
-    def get_capital_gains(self, proxy=None) -> pd.Series:
-        return self._lazy_load_price_history().get_capital_gains(proxy)
+    def get_capital_gains(self, proxy=None, period="max") -> pd.Series:
+        return self._lazy_load_price_history().get_capital_gains(period=period, proxy=proxy)
 
-    def get_splits(self, proxy=None) -> pd.Series:
-        return self._lazy_load_price_history().get_splits(proxy)
+    def get_splits(self, proxy=None, period="max") -> pd.Series:
+        return self._lazy_load_price_history().get_splits(period=period, proxy=proxy)
 
-    def get_actions(self, proxy=None) -> pd.Series:
-        return self._lazy_load_price_history().get_actions(proxy)
+    def get_actions(self, proxy=None, period="max") -> pd.Series:
+        return self._lazy_load_price_history().get_actions(period=period, proxy=proxy)
 
     def get_shares(self, proxy=None, as_dict=False) -> Union[pd.DataFrame, dict]:
         self._fundamentals.proxy = proxy or self.proxy
@@ -534,118 +549,117 @@ class TickerBase:
         self._isin = data.split(search_str)[1].split('"')[0].split('|')[0]
         return self._isin
 
-    def get_news(self, proxy=None) -> list:
+    def get_news(self, count=10, tab="news", proxy=None) -> list:
+        """Allowed options for tab: "news", "all", "press releases"""
         if self._news:
             return self._news
 
-        # Getting data from json
-        url = f"{_BASE_URL_}/v1/finance/search?q={self.ticker}"
-        data = self._data.cache_get(url=url, proxy=proxy)
+        logger = utils.get_yf_logger()
+
+        tab_queryrefs = {
+            "all": "newsAll",
+            "news": "latestNews",
+            "press releases": "pressRelease",
+        }
+
+        query_ref = tab_queryrefs.get(tab.lower())
+        if not query_ref:
+            raise ValueError(f"Invalid tab name '{tab}'. Choose from: {', '.join(tab_queryrefs.keys())}")
+
+        url = f"{_ROOT_URL_}/xhr/ncp?queryRef={query_ref}&serviceKey=ncp_fin"
+        payload = {
+            "serviceConfig": {
+                "snippetCount": count,
+                "s": [self.ticker]
+            }
+        }
+
+        data = self._data.post(url, body=payload, proxy=proxy)
         if data is None or "Will be right back" in data.text:
             raise RuntimeError("*** YAHOO! FINANCE IS CURRENTLY DOWN! ***\n"
                                "Our engineers are working quickly to resolve "
                                "the issue. Thank you for your patience.")
         try:
             data = data.json()
-        except (_json.JSONDecodeError): 
-            logger = utils.get_yf_logger()
+        except _json.JSONDecodeError:
             logger.error(f"{self.ticker}: Failed to retrieve the news and received faulty response instead.")
             data = {}
 
-        # parse news
-        self._news = data.get("news", [])
+        news = data.get("data", {}).get("tickerStream", {}).get("stream", [])
+
+        self._news = [article for article in news if not article.get('ad', [])]
         return self._news
 
     @utils.log_indent_decorator
     def get_earnings_dates(self, limit=12, proxy=None) -> Optional[pd.DataFrame]:
         """
         Get earning dates (future and historic)
-        :param limit: max amount of upcoming and recent earnings dates to return.
-                      Default value 12 should return next 4 quarters and last 8 quarters.
-                      Increase if more history is needed.
-
-        :param proxy: requests proxy to use.
-        :return: pandas dataframe
+        
+        Args:
+            limit (int): max amount of upcoming and recent earnings dates to return.
+                Default value 12 should return next 4 quarters and last 8 quarters.
+                Increase if more history is needed.
+            proxy: requests proxy to use.
+        
+        Returns:
+            pd.DataFrame
         """
-        if self._earnings_dates and limit in self._earnings_dates:
-            return self._earnings_dates[limit]
-
         logger = utils.get_yf_logger()
+        clamped_limit = min(limit, 100)  # YF caps at 100, don't go higher
 
-        page_size = min(limit, 100)  # YF caps at 100, don't go higher
-        page_offset = 0
-        dates = None
-        while True:
-            url = f"{_ROOT_URL_}/calendar/earnings?symbol={self.ticker}&offset={page_offset}&size={page_size}"
-            data = self._data.cache_get(url=url, proxy=proxy).text
+        if self._earnings_dates and clamped_limit in self._earnings_dates:
+            return self._earnings_dates[clamped_limit]
 
-            if "Will be right back" in data:
-                raise RuntimeError("*** YAHOO! FINANCE IS CURRENTLY DOWN! ***\n"
-                                   "Our engineers are working quickly to resolve "
-                                   "the issue. Thank you for your patience.")
+        # Fetch data
+        url = f"{_QUERY1_URL_}/v1/finance/visualization"
+        params = {"lang": "en-US", "region": "US"}
+        body = {
+            "size": clamped_limit,
+            "query": {
+                "operator": "and",
+                "operands": [
+                    {"operator": "eq", "operands": ["ticker", self.ticker]},
+                    {"operator": "eq", "operands": ["eventtype", "2"]}
+                ]
+            },
+            "sortField": "startdatetime",
+            "sortType": "DESC",
+            "entityIdType": "earnings",
+            "includeFields": ["startdatetime", "timeZoneShortName", "epsestimate", "epsactual", "epssurprisepct"]
+        }
+        response = self._data.post(url, params=params, body=body, proxy=proxy)
+        json_data = response.json()
 
-            try:
-                data = pd.read_html(StringIO(data))[0]
-            except ValueError:
-                if page_offset == 0:
-                    # Should not fail on first page
-                    if "Showing Earnings for:" in data:
-                        # Actually YF was successful, problem is company doesn't have earnings history
-                        dates = utils.empty_earnings_dates_df()
-                break
-            if dates is None:
-                dates = data
-            else:
-                dates = pd.concat([dates, data], axis=0)
+        # Extract data
+        columns = [row['label'] for row in json_data['finance']['result'][0]['documents'][0]['columns']]
+        rows = json_data['finance']['result'][0]['documents'][0]['rows']
+        df = pd.DataFrame(rows, columns=columns)
 
-            page_offset += page_size
-            # got less data then we asked for or already fetched all we requested, no need to fetch more pages
-            if len(data) < page_size or len(dates) >= limit:
-                dates = dates.iloc[:limit]
-                break
-            else:
-                # do not fetch more than needed next time
-                page_size = min(limit - len(dates), page_size)
-
-        if dates is None or dates.shape[0] == 0:
+        if df.empty:
             _exception = YFEarningsDateMissing(self.ticker)
             err_msg = str(_exception)
             logger.error(f'{self.ticker}: {err_msg}')
             return None
-        dates = dates.reset_index(drop=True)
 
-        # Drop redundant columns
-        dates = dates.drop(["Symbol", "Company"], axis=1)
+        # Calculate earnings date
+        df['Earnings Date'] = pd.to_datetime(df['Event Start Date'])
+        tz = self._get_ticker_tz(proxy=proxy, timeout=30)
+        if df['Earnings Date'].dt.tz is None:
+            df['Earnings Date'] = df['Earnings Date'].dt.tz_localize(tz)
+        else:
+            df['Earnings Date'] = df['Earnings Date'].dt.tz_convert(tz)
 
         # Convert types
-        for cn in ["EPS Estimate", "Reported EPS", "Surprise(%)"]:
-            dates.loc[dates[cn] == '-', cn] = float("nan")
-            dates[cn] = dates[cn].astype(float)
+        columns_to_update = ['Surprise (%)', 'EPS Estimate', 'Reported EPS']
+        df[columns_to_update] = df[columns_to_update].astype('float64').replace(0.0, np.nan)
 
-        # Convert % to range 0->1:
-        dates["Surprise(%)"] *= 0.01
+        # Format the dataframe
+        df.drop(['Event Start Date', 'Timezone short name'], axis=1, inplace=True)
+        df.set_index('Earnings Date', inplace=True)
+        df.rename(columns={'Surprise (%)': 'Surprise(%)'}, inplace=True)  # Compatibility
 
-        # Parse earnings date string
-        cn = "Earnings Date"
-        # - remove AM/PM and timezone from date string
-        tzinfo = dates[cn].str.extract('([AP]M[a-zA-Z]*)$')
-        dates[cn] = dates[cn].replace(' [AP]M[a-zA-Z]*$', '', regex=True)
-        # - split AM/PM from timezone
-        tzinfo = tzinfo[0].str.extract('([AP]M)([a-zA-Z]*)', expand=True)
-        tzinfo.columns = ["AM/PM", "TZ"]
-        # - combine and parse
-        dates[cn] = dates[cn] + ' ' + tzinfo["AM/PM"]
-        dates[cn] = pd.to_datetime(dates[cn], format="%b %d, %Y, %I %p")
-        # - instead of attempting decoding of ambiguous timezone abbreviation, just use 'info':
-        self._quote.proxy = proxy or self.proxy
-        tz = self._get_ticker_tz(proxy=proxy, timeout=30)
-        dates[cn] = dates[cn].dt.tz_localize(tz)
-
-        dates = dates.set_index("Earnings Date")
-
-        self._earnings_dates[limit] = dates
-
-        return dates
+        self._earnings_dates[clamped_limit] = df
+        return df
 
     def get_history_metadata(self, proxy=None) -> dict:
         return self._lazy_load_price_history().get_history_metadata(proxy)
